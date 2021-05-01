@@ -1,12 +1,6 @@
 --
 -- Set associative dcache write-through
 --
--- TODO (in no specific order):
---
--- * See list in icache.vhdl
--- * Complete load misses on the cycle when WB data comes instead of
---   at the end of line (this requires dealing with requests coming in
---   while not idle...)
 --
 library ieee;
 use ieee.std_logic_1164.all;
@@ -57,7 +51,7 @@ end entity dcache;
 architecture rtl of dcache is
     -- BRAM organisation: We never access more than wishbone_data_bits at
     -- a time so to save resources we make the array only that wide, and
-    -- use consecutive indices for to make a cache "line"
+    -- use consecutive indices to make a cache "line"
     --
     -- ROW_SIZE is the width in bytes of the BRAM (based on WB, so 64-bits)
     constant ROW_SIZE      : natural := wishbone_data_bits / 8;
@@ -206,21 +200,82 @@ architecture rtl of dcache is
     -- which means that the BRAM output is delayed by an extra cycle.
     --
     -- Thus, the dcache has a 2-stage internal pipeline for cache hits
-    -- with no stalls.
+    -- with no stalls.  Stores also complete in 2 cycles in most
+    -- circumstances.
     --
-    -- All other operations are handled via stalling in the first stage.
+    -- A request proceeds through the pipeline as follows.
     --
-    -- The second stage can thus complete a hit at the same time as the
-    -- first stage emits a stall for a complex op.
+    -- Cycle 0: Request is received from loadstore or mmu if either
+    -- d_in.valid or m_in.valid is 1 (not both).  In this cycle portions
+    -- of the address are presented to the TLB tag RAM and data RAM
+    -- and the cache tag RAM and data RAM.
     --
+    -- Clock edge between cycle 0 and cycle 1:
+    -- Request is stored in r0 (assuming r0_full was 0).  TLB tag and
+    -- data RAMs are read, and the cache tag RAM is read.  (Cache data
+    -- comes out a cycle later due to its output register, giving the
+    -- whole of cycle 1 to read the cache data RAM.)
+    --
+    -- Cycle 1: TLB and cache tag matching is done, the real address
+    -- (RA) for the access is calculated, and the type of operation is
+    -- determined (the OP_* values above).  This gives the TLB way for
+    -- a TLB hit, and the cache way for a hit or the way to replace
+    -- for a load miss.
+    --
+    -- Clock edge between cycle 1 and cycle 2:
+    -- Request is stored in r1 (assuming r1.full was 0)
+    -- The state machine transitions out of IDLE state for a load miss,
+    -- a store, a dcbz, or a non-cacheable load.  r1.full is set to 1
+    -- for a load miss, dcbz or non-cacheable load but not a store.
+    --
+    -- Cycle 2: Completion signals are asserted for a load hit,
+    -- a store (excluding dcbz), a TLB operation, a conditional
+    -- store which failed due to no matching reservation, or an error
+    -- (cache hit on non-cacheable operation, TLB miss, or protection
+    -- fault).
+    --
+    -- For a load miss, store, or dcbz, the state machine initiates
+    -- a wishbone cycle, which takes at least 2 cycles.  For a store,
+    -- if another store comes in with the same cache tag (therefore
+    -- in the same 4k page), it can be added on to the existing cycle,
+    -- subject to some constraints.
+    -- While r1.full = 1, no new requests can go from r0 to r1, but
+    -- requests can come in to r0 and be satisfied if they are
+    -- cacheable load hits or stores with the same cache tag.
+    --
+    -- Writing to the cache data RAM is done at the clock edge
+    -- at the end of cycle 2 for a store hit (excluding dcbz).
+    -- Stores that miss are not written to the cache data RAM
+    -- but just stored through to memory.
+    -- Dcbz is done like a cache miss, but the wishbone cycle
+    -- is a write rather than a read, and zeroes are written to
+    -- the cache data RAM.  Thus dcbz will allocate the line in
+    -- the cache as well as zeroing memory.
+    --
+    -- Since stores are written to the cache data RAM at the end of
+    -- cycle 2, and loads can come in and hit on the data just stored,
+    -- there is a two-stage bypass from store data to load data to
+    -- make sure that loads always see previously-stored data even
+    -- if it has not yet made it to the cache data RAM.
+    --
+    -- Load misses read the requested dword of the cache line first in
+    -- the memory read request and then cycle around through the other
+    -- dwords.  The load is completed on the cycle after the requested
+    -- dword comes back from memory (using a forwarding path, rather
+    -- than going via the cache data RAM).  We maintain an array of
+    -- valid bits per dword for the line being refilled so that
+    -- subsequent load requests to the same line can be completed as
+    -- soon as the necessary data comes in from memory, without
+    -- waiting for the whole line to be read.
 
     -- Stage 0 register, basically contains just the latched request
     type reg_stage_0_t is record
         req   : Loadstore1ToDcacheType;
-        tlbie : std_ulogic;
-        doall : std_ulogic;
-        tlbld : std_ulogic;
+        tlbie : std_ulogic;     -- indicates a tlbie request (from MMU)
+        doall : std_ulogic;     -- with tlbie, indicates flush whole TLB
+        tlbld : std_ulogic;     -- indicates a TLB load request (from MMU)
         mmu_req : std_ulogic;   -- indicates source of request
+        d_valid : std_ulogic;   -- indicates req.data is valid now
     end record;
 
     signal r0 : reg_stage_0_t;
@@ -510,16 +565,26 @@ begin
                 r.mmu_req := '1';
             else
                 r.req := d_in;
+                r.req.data := (others => '0');
                 r.tlbie := '0';
                 r.doall := '0';
                 r.tlbld := '0';
                 r.mmu_req := '0';
             end if;
+            r.d_valid := '0';
             if rst = '1' then
                 r0_full <= '0';
-            elsif r1.full = '0' or r0_full = '0' then
+            elsif (r1.full = '0' and d_in.hold = '0') or r0_full = '0' then
                 r0 <= r;
                 r0_full <= r.req.valid;
+            end if;
+            -- Sample data the cycle after a request comes in from loadstore1.
+            -- If another request has come in already then the data will get
+            -- put directly into req.data below.
+            if r0.req.valid = '1' and r.req.valid = '0' and r0.d_valid = '0' and
+                r0.mmu_req = '0' then
+                r0.req.data <= d_in.data;
+                r0.d_valid <= '1';
             end if;
         end if;
     end process;
@@ -528,8 +593,8 @@ begin
     m_out.stall <= '0';
 
     -- Hold off the request in r0 when r1 has an uncompleted request
-    r0_stall <= r0_full and r1.full;
-    r0_valid <= r0_full and not r1.full;
+    r0_stall <= r0_full and (r1.full or d_in.hold);
+    r0_valid <= r0_full and not r1.full and not d_in.hold;
     stall_out <= r0_stall;
 
     -- TLB
@@ -892,10 +957,10 @@ begin
             -- XXX or if r0.req.nc = '1'
             if r0.req.load = '1' then
                 -- load with reservation
-                set_rsrv <= '1';
+                set_rsrv <= r0.req.atomic_last;
             else
                 -- store conditional
-                clear_rsrv <= '1';
+                clear_rsrv <= r0.req.atomic_last;
                 if reservation.valid = '0' or
                     r0.req.addr(63 downto LINE_OFF_BITS) /= reservation.addr then
                     cancel_store <= '1';
@@ -1251,10 +1316,12 @@ begin
                     req.dcbz := r0.req.dcbz;
                     req.real_addr := ra;
                     -- Force data to 0 for dcbz
-                    if r0.req.dcbz = '0' then
+                    if r0.req.dcbz = '1' then
+                        req.data := (others => '0');
+                    elsif r0.d_valid = '1' then
                         req.data := r0.req.data;
                     else
-                        req.data := (others => '0');
+                        req.data := d_in.data;
                     end if;
                     -- Select all bytes for dcbz and for cacheable loads
                     if r0.req.dcbz = '1' or (r0.req.load = '1' and r0.req.nc = '0') then
@@ -1384,10 +1451,10 @@ begin
                         -- complete the request next cycle.
                         -- Compare the whole address in case the request in
                         -- r1.req is not the one that started this refill.
-			if r1.full = '1' and r1.req.same_tag = '1' and
-                            ((r1.dcbz = '1' and r1.req.dcbz = '1') or
-                             (r1.dcbz = '0' and r1.req.op = OP_LOAD_MISS)) and
-                            r1.store_row = get_row(r1.req.real_addr) then
+			if req.valid = '1' and req.same_tag = '1' and
+                            ((r1.dcbz = '1' and req.dcbz = '1') or
+                             (r1.dcbz = '0' and req.op = OP_LOAD_MISS)) and
+                            r1.store_row = get_row(req.real_addr) then
                             r1.full <= '0';
                             r1.slow_valid <= '1';
                             if r1.mmu_req = '0' then

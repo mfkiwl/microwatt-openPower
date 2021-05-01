@@ -11,8 +11,17 @@ entity core is
         SIM : boolean := false;
 	DISABLE_FLATTEN : boolean := false;
         EX1_BYPASS : boolean := true;
+        HAS_FPU : boolean := true;
+        HAS_BTC : boolean := true;
 	ALT_RESET_ADDRESS : std_ulogic_vector(63 downto 0) := (others => '0');
-        LOG_LENGTH : natural := 512
+        LOG_LENGTH : natural := 512;
+        ICACHE_NUM_LINES : natural := 64;
+        ICACHE_NUM_WAYS : natural := 2;
+        ICACHE_TLB_SIZE : natural := 64;
+        DCACHE_NUM_LINES : natural := 64;
+        DCACHE_NUM_WAYS : natural := 2;
+        DCACHE_TLB_SET_SIZE : natural := 64;
+        DCACHE_TLB_NUM_WAYS : natural := 2
         );
     port (
         clk          : in std_ulogic;
@@ -44,6 +53,7 @@ end core;
 architecture behave of core is
     -- icache signals
     signal fetch1_to_icache : Fetch1ToIcacheType;
+    signal writeback_to_fetch1: WritebackToFetch1Type;
     signal icache_to_decode1 : IcacheToDecode1Type;
     signal mmu_to_icache : MmuToIcacheType;
 
@@ -64,7 +74,8 @@ architecture behave of core is
 
     -- execute signals
     signal execute1_to_writeback: Execute1ToWritebackType;
-    signal execute1_to_fetch1: Execute1ToFetch1Type;
+    signal execute1_bypass: bypass_data_t;
+    signal execute1_cr_bypass: cr_bypass_data_t;
 
     -- load store signals
     signal execute1_to_loadstore1: Execute1ToLoadstore1Type;
@@ -78,6 +89,11 @@ architecture behave of core is
     signal dcache_to_loadstore1: DcacheToLoadstore1Type;
     signal mmu_to_dcache: MmuToDcacheType;
     signal dcache_to_mmu: DcacheToMmuType;
+
+    -- FPU signals
+    signal execute1_to_fpu: Execute1ToFPUType;
+    signal fpu_to_execute1: FPUToExecute1Type;
+    signal fpu_to_writeback: FPUToWritebackType;
 
     -- local signals
     signal fetch1_stall_in : std_ulogic;
@@ -95,10 +111,11 @@ architecture behave of core is
     signal decode1_flush: std_ulogic;
     signal fetch1_flush: std_ulogic;
 
-    signal complete: std_ulogic;
+    signal complete: instr_tag_t;
     signal terminate: std_ulogic;
     signal core_rst: std_ulogic;
     signal icache_inv: std_ulogic;
+    signal do_interrupt: std_ulogic;
 
     -- Delayed/Latched resets and alt_reset
     signal rst_fetch1  : std_ulogic := '1';
@@ -108,7 +125,9 @@ architecture behave of core is
     signal rst_dec1    : std_ulogic := '1';
     signal rst_dec2    : std_ulogic := '1';
     signal rst_ex1     : std_ulogic := '1';
+    signal rst_fpu     : std_ulogic := '1';
     signal rst_ls1     : std_ulogic := '1';
+    signal rst_wback   : std_ulogic := '1';
     signal rst_dbg     : std_ulogic := '1';
     signal alt_reset_d : std_ulogic;
 
@@ -170,7 +189,9 @@ begin
             rst_dec1    <= core_rst;
             rst_dec2    <= core_rst;
             rst_ex1     <= core_rst;
+            rst_fpu     <= core_rst;
             rst_ls1     <= core_rst;
+            rst_wback   <= core_rst;
             rst_dbg     <= rst;
             alt_reset_d <= alt_reset;
         end if;
@@ -179,7 +200,8 @@ begin
     fetch1_0: entity work.fetch1
         generic map (
             RESET_ADDRESS => (others => '0'),
-	    ALT_RESET_ADDRESS => ALT_RESET_ADDRESS
+	    ALT_RESET_ADDRESS => ALT_RESET_ADDRESS,
+            HAS_BTC => HAS_BTC
             )
         port map (
             clk => clk,
@@ -187,9 +209,10 @@ begin
 	    alt_reset_in => alt_reset_d,
             stall_in => fetch1_stall_in,
             flush_in => fetch1_flush,
+            inval_btc => ex1_icache_inval or mmu_to_icache.tlbie,
 	    stop_in => dbg_core_stop,
             d_in => decode1_to_fetch1,
-            e_in => execute1_to_fetch1,
+            w_in => writeback_to_fetch1,
             i_out => fetch1_to_icache,
             log_out => log_data(42 downto 0)
             );
@@ -201,8 +224,9 @@ begin
         generic map(
             SIM => SIM,
             LINE_SIZE => 64,
-            NUM_LINES => 64,
-	    NUM_WAYS => 2,
+            NUM_LINES => ICACHE_NUM_LINES,
+            NUM_WAYS => ICACHE_NUM_WAYS,
+            TLB_SIZE => ICACHE_TLB_SIZE,
             LOG_LENGTH => LOG_LENGTH
             )
         port map(
@@ -224,6 +248,7 @@ begin
 
     decode1_0: entity work.decode1
         generic map(
+            HAS_FPU => HAS_FPU,
             LOG_LENGTH => LOG_LENGTH
             )
         port map (
@@ -244,6 +269,7 @@ begin
     decode2_0: entity work.decode2
         generic map (
             EX1_BYPASS => EX1_BYPASS,
+            HAS_FPU => HAS_FPU,
             LOG_LENGTH => LOG_LENGTH
             )
         port map (
@@ -260,6 +286,8 @@ begin
             r_out => decode2_to_register_file,
             c_in => cr_file_to_decode2,
             c_out => decode2_to_cr_file,
+            execute_bypass => execute1_bypass,
+            execute_cr_bypass => execute1_cr_bypass,
             log_out => log_data(119 downto 110)
             );
     decode2_busy_in <= ex1_busy_out;
@@ -267,6 +295,7 @@ begin
     register_file_0: entity work.register_file
         generic map (
             SIM => SIM,
+            HAS_FPU => HAS_FPU,
             LOG_LENGTH => LOG_LENGTH
             )
         port map (
@@ -280,7 +309,7 @@ begin
             dbg_gpr_data => dbg_gpr_data,
 	    sim_dump => terminate,
 	    sim_dump_done => sim_cr_dump,
-            log_out => log_data(255 downto 185)
+            log_out => log_data(255 downto 184)
 	    );
 
     cr_file_0: entity work.cr_file
@@ -294,25 +323,30 @@ begin
             d_out => cr_file_to_decode2,
             w_in => writeback_to_cr_file,
             sim_dump => sim_cr_dump,
-            log_out => log_data(184 downto 172)
+            log_out => log_data(183 downto 171)
             );
 
     execute1_0: entity work.execute1
         generic map (
             EX1_BYPASS => EX1_BYPASS,
+            HAS_FPU => HAS_FPU,
             LOG_LENGTH => LOG_LENGTH
             )
         port map (
             clk => clk,
             rst => rst_ex1,
-            flush_out => flush,
+            flush_in => flush,
 	    busy_out => ex1_busy_out,
             e_in => decode2_to_execute1,
             l_in => loadstore1_to_execute1,
+            fp_in => fpu_to_execute1,
             ext_irq_in => ext_irq,
+            interrupt_in => do_interrupt,
             l_out => execute1_to_loadstore1,
-            f_out => execute1_to_fetch1,
+            fp_out => execute1_to_fpu,
             e_out => execute1_to_writeback,
+            bypass_data => execute1_bypass,
+            bypass_cr_data => execute1_cr_bypass,
 	    icache_inval => ex1_icache_inval,
             dbg_msr_out => msr,
             terminate_out => terminate,
@@ -322,8 +356,27 @@ begin
             log_wr_addr => log_wr_addr
             );
 
+    with_fpu: if HAS_FPU generate
+    begin
+        fpu_0: entity work.fpu
+            port map (
+                clk => clk,
+                rst => rst_fpu,
+                e_in => execute1_to_fpu,
+                e_out => fpu_to_execute1,
+                w_out => fpu_to_writeback
+                );
+    end generate;
+
+    no_fpu: if not HAS_FPU generate
+    begin
+        fpu_to_execute1 <= FPUToExecute1Init;
+        fpu_to_writeback <= FPUToWritebackInit;
+    end generate;
+
     loadstore1_0: entity work.loadstore1
         generic map (
+            HAS_FPU => HAS_FPU,
             LOG_LENGTH => LOG_LENGTH
             )
         port map (
@@ -354,8 +407,10 @@ begin
     dcache_0: entity work.dcache
         generic map(
             LINE_SIZE => 64,
-            NUM_LINES => 64,
-	    NUM_WAYS => 2,
+            NUM_LINES => DCACHE_NUM_LINES,
+            NUM_WAYS => DCACHE_NUM_WAYS,
+            TLB_SET_SIZE => DCACHE_TLB_SET_SIZE,
+            TLB_NUM_WAYS => DCACHE_TLB_NUM_WAYS,
             LOG_LENGTH => LOG_LENGTH
             )
         port map (
@@ -368,20 +423,25 @@ begin
             stall_out => dcache_stall_out,
             wishbone_in => wishbone_data_in,
             wishbone_out => wishbone_data_out,
-            log_out => log_data(171 downto 152)
+            log_out => log_data(170 downto 151)
             );
 
     writeback_0: entity work.writeback
         port map (
             clk => clk,
+            rst => rst_wback,
+            flush_out => flush,
             e_in => execute1_to_writeback,
             l_in => loadstore1_to_writeback,
+            fp_in => fpu_to_writeback,
             w_out => writeback_to_register_file,
             c_out => writeback_to_cr_file,
+            f_out => writeback_to_fetch1,
+            interrupt_out => do_interrupt,
             complete_out => complete
             );
 
-    log_data(151 downto 150) <= "00";
+    log_data(150) <= '0';
     log_data(139 downto 135) <= "00000";
 
     debug_0: entity work.core_debug
